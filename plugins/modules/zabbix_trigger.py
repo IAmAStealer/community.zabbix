@@ -290,3 +290,173 @@ class Trigger(ZabbixBase):
         'recovery_expression': 1,
         'none': 2
     }
+
+    def get_triggers(self, trigger_name, host_name, template_name):
+        host = host_name if host_name is not None else template_name
+        try:
+            return self._zapi.trigger.get({'filter': {'description': trigger_name, 'host': host}, "selectDependencies": "extend", "selectTags": "extend"})
+        except Exception as e:
+            self._module.fail_json(msg="Failed to get trigger: %s" % e)
+
+    def build_api_payload(self, name, params, desc=None, dependencies=None):
+        payload = params.copy()
+        
+        payload['description'] = name
+        
+        if desc is not None:
+            payload['comments'] = desc
+
+        if 'severity' in params or 'priority' in params:
+            severity_str = params.get('severity', params.get('priority'))
+            if severity_str in self.PRIORITY_TYPES:
+                payload['priority'] = self.PRIORITY_TYPES[severity_str]
+            payload.pop('severity', None)
+
+        if 'enabled' in params:
+            payload['status'] = 0 if params['enabled'] else 1
+            payload.pop('enabled', None)
+        elif 'status' in params:
+            payload['status'] = 0 if params['status'] == 'enabled' else 1
+
+        if 'generate_multiple_events' in params:
+            payload['type'] = int(bool(params['generate_multiple_events']))
+            payload.pop('generate_multiple_events', None)
+            
+        if 'manual_close' in params:
+            payload['manual_close'] = int(bool(params['manual_close']))
+
+        if 'recovery_mode' in params and params['recovery_mode'] in self.RECOVERY_MODES:
+            payload['recovery_mode'] = self.RECOVERY_MODES[params['recovery_mode']]
+
+        if 'correlation_mode' in params:
+            payload['correlation_mode'] = 0 if params['correlation_mode'] == 'all' else 1
+
+        if dependencies:
+            payload['dependencies'] = []
+            for dep in dependencies:
+                triggers = self.get_triggers(dep['name'], dep.get('host_name'), dep.get('template_name'))
+                payload['dependencies'].extend([{'triggerid': t['triggerid']} for t in triggers])
+
+        return payload
+
+    def add_trigger(self, api_payload):
+        if self._module.check_mode:
+            self._module.exit_json(changed=True)
+        try:
+            return self._zapi.trigger.create(api_payload)
+        except Exception as e:
+            self._module.fail_json(msg="Failed to create trigger: %s" % e)
+
+    def update_trigger(self, api_payload):
+        if self._module.check_mode:
+            self._module.exit_json(changed=True)
+        try:
+            return self._zapi.trigger.update(api_payload)
+        except Exception as e:
+            self._module.fail_json(msg="Failed to update trigger: %s" % e)
+
+    def check_trigger_changed(self, old_trigger):
+        try:
+            new_trigger = self._zapi.trigger.get({"triggerids": "%s" % old_trigger['triggerid'], "selectDependencies": "extend", "selectTags": "extend"})[0]
+        except Exception as e:
+            self._module.fail_json(msg="Failed to get trigger: %s" % e)
+        return old_trigger != new_trigger
+
+    def delete_trigger(self, trigger_id):
+        if self._module.check_mode:
+            self._module.exit_json(changed=True)
+        try:
+            return self._zapi.trigger.delete(trigger_id)
+        except Exception as e:
+            self._module.fail_json(msg="Failed to delete trigger: %s" % e)
+
+
+def main():
+    argument_spec = zabbix_utils.zabbix_common_argument_spec()
+    argument_spec.update(dict(
+        name=dict(type='str', required=True),
+        host_name=dict(type='str', required=False),
+        template_name=dict(type='str', required=False),
+        params=dict(type='dict', required=False, default={}),
+        desc=dict(type='str', required=False, aliases=['description']),
+        dependencies=dict(
+            type='list', 
+            elements='dict', 
+            required=False,
+            options=dict(
+                name=dict(type='str', required=True),
+                host_name=dict(type='str', required=False),
+                template_name=dict(type='str', required=False)
+            )
+        ),
+        state=dict(type='str', default="present", choices=['present', 'absent']),
+    ))
+    
+    module = AnsibleModule(
+        argument_spec=argument_spec,
+        required_one_of=[
+            ['host_name', 'template_name']
+        ],
+        mutually_exclusive=[
+            ['host_name', 'template_name']
+        ],
+        required_if=[
+            ['state', 'present', ['params']]
+        ],
+        supports_check_mode=True
+    )
+
+    name = module.params['name']
+    host_name = module.params.get('host_name')
+    template_name = module.params.get('template_name')
+    params = module.params.get('params', {})
+    desc = module.params.get('desc')
+    dependencies = module.params.get('dependencies')
+    state = module.params['state']
+
+    trigger = Trigger(module)
+
+    if state == "absent":
+        triggers = trigger.get_triggers(name, host_name, template_name)
+        if not triggers:
+            module.exit_json(changed=False, result="No trigger to delete.")
+        else:
+            delete_ids = [t['triggerid'] for t in triggers]
+            results = trigger.delete_trigger(delete_ids)
+            module.exit_json(changed=True, result=results)
+
+    elif state == "present":
+        api_payload = trigger.build_api_payload(name, params, desc, dependencies)
+        triggers = trigger.get_triggers(name, host_name, template_name)
+        
+        if 'new_name' in api_payload:
+            new_name_trigger = trigger.get_triggers(api_payload['new_name'], host_name, template_name)
+            if new_name_trigger:
+                module.exit_json(changed=False, result=[{'triggerids': [new_name_trigger[0]['triggerid']]}])
+                
+        if not triggers:
+            if 'new_name' in api_payload:
+                module.fail_json(msg='Cannot rename trigger: %s is not found' % name)
+            results = trigger.add_trigger(api_payload)
+            module.exit_json(changed=True, result=results)
+        else:
+            results = []
+            changed = False
+            for t in triggers:
+                # Créer une copie pour chaque itération afin d'éviter la destruction des clés
+                current_payload = api_payload.copy()
+                current_payload['triggerid'] = t['triggerid']
+                current_payload.pop('description', None)
+                
+                if 'new_name' in current_payload:
+                    current_payload['description'] = current_payload.pop("new_name")
+                    
+                results.append(trigger.update_trigger(current_payload))
+                if trigger.check_trigger_changed(t):
+                    changed = True
+                    
+            module.exit_json(changed=changed, result=results)
+
+
+if __name__ == '__main__':
+    main()
